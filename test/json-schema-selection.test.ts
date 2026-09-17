@@ -355,7 +355,47 @@ describe('Status bar should work in multiple different scenarios', () => {
     expect(quickPick.selectedItems).to.deep.equal([quickPick.items[0]]);
   });
 
-  it('Should write disableSchemaDetection when No JSON Schema is selected', async () => {
+  it('Should add a selected schema as an exact workspace file mapping', async () => {
+    const context: vscode.ExtensionContext = {
+      subscriptions: [],
+    } as vscode.ExtensionContext;
+    const statusBar = ({ show: sandbox.stub(), hide: sandbox.stub() } as unknown) as vscode.StatusBarItem;
+    const quickPick = createQuickPickStubValue<TestSchemaItem>();
+    const update = sandbox.stub();
+    const schemaUri = 'https://json.schemastore.org/github-workflow.json';
+    createStatusBarItemStub.returns(statusBar);
+    createQuickPickStub.returns(quickPick);
+    clcStub.sendRequest.resolves([{ uri: schemaUri, name: 'github-workflow' }]);
+    activeTextEditor = ({
+      document: { languageId: 'yaml', uri: vscode.Uri.parse('/workspace/test.yaml') },
+    } as unknown) as vscode.TextEditor;
+    sandbox
+      .stub(vscode.workspace, 'getConfiguration')
+      .withArgs('yaml')
+      .returns(({
+        get: sandbox.stub().callsFake((section: string) => (section === 'schemas' ? {} : [])),
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? {} : undefined,
+        })),
+        update,
+      } as unknown) as vscode.WorkspaceConfiguration);
+
+    createJSONSchemaStatusBarItem(context, (clcStub as unknown) as CommonLanguageClient);
+    const command = registerCommandStub.firstCall.args[1];
+    await command();
+    const schemaItem = quickPick.items.find((item) => item.schema);
+    quickPick.select([schemaItem as TestSchemaItem]);
+    await quickPick.accept();
+
+    expect(update).calledOnceWith(
+      'schemas',
+      { [schemaUri]: 'file:///workspace/test.yaml' },
+      vscode.ConfigurationTarget.Workspace
+    );
+    expect(update).not.calledWith('disableSchemaDetection');
+  });
+
+  it('Should remove an exact schema mapping without changing disableSchemaDetection', async () => {
     const context: vscode.ExtensionContext = {
       subscriptions: [],
     } as vscode.ExtensionContext;
@@ -364,7 +404,9 @@ describe('Status bar should work in multiple different scenarios', () => {
     const update = sandbox.stub();
     createStatusBarItemStub.returns(statusBar);
     createQuickPickStub.returns(quickPick);
-    clcStub.sendRequest.resolves([{ uri: 'https://foo.com/bar.json', name: 'bar schema' }]);
+    const schemaUri = 'https://foo.com/bar.json';
+    const schemas = { [schemaUri]: 'file:///foo.yaml' };
+    clcStub.sendRequest.resolves([{ uri: schemaUri, name: 'bar schema', usedForCurrentFile: true }]);
     activeTextEditor = ({
       document: { languageId: 'yaml', uri: vscode.Uri.parse('/foo.yaml') },
     } as unknown) as vscode.TextEditor;
@@ -372,18 +414,116 @@ describe('Status bar should work in multiple different scenarios', () => {
       .stub(vscode.workspace, 'getConfiguration')
       .withArgs('yaml')
       .returns(({
-        get: sandbox.stub().withArgs('disableSchemaDetection').returns([]),
+        get: sandbox.stub().callsFake((section: string) => (section === 'schemas' ? schemas : ['file:///unchanged.yaml'])),
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? schemas : ['file:///unchanged.yaml'],
+        })),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
     createJSONSchemaStatusBarItem(context, (clcStub as unknown) as CommonLanguageClient);
     const command = registerCommandStub.firstCall.args[1];
     await command();
-    quickPick.select([quickPick.items[0]]);
+    quickPick.select([]);
     await quickPick.accept();
 
-    expect(update).calledWith('disableSchemaDetection', ['file:///foo.yaml']);
+    expect(update).calledOnceWith('schemas', {}, vscode.ConfigurationTarget.Workspace);
+    expect(update).not.calledWith('disableSchemaDetection');
     expect(quickPick.hide).calledOnce;
+  });
+
+  it('Should preserve a glob and add a negated file URI when its schema is deselected', async () => {
+    const context: vscode.ExtensionContext = {
+      subscriptions: [],
+    } as vscode.ExtensionContext;
+    const statusBar = ({ show: sandbox.stub(), hide: sandbox.stub() } as unknown) as vscode.StatusBarItem;
+    const quickPick = createQuickPickStubValue<TestSchemaItem>();
+    const update = sandbox.stub();
+    const schemaUri = 'https://json.schemastore.org/github-workflow.json';
+    const workspaceSchemas = { [schemaUri]: '*.yaml' };
+    createStatusBarItemStub.returns(statusBar);
+    createQuickPickStub.returns(quickPick);
+    clcStub.sendRequest.resolves([{ uri: schemaUri, name: 'github-workflow', usedForCurrentFile: true }]);
+    activeTextEditor = ({
+      document: { languageId: 'yaml', uri: vscode.Uri.parse('/workspace/test.yaml') },
+    } as unknown) as vscode.TextEditor;
+    sandbox
+      .stub(vscode.workspace, 'getConfiguration')
+      .withArgs('yaml')
+      .returns(({
+        get: sandbox.stub().callsFake((section: string) => (section === 'schemas' ? workspaceSchemas : [])),
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? workspaceSchemas : undefined,
+        })),
+        update,
+      } as unknown) as vscode.WorkspaceConfiguration);
+
+    createJSONSchemaStatusBarItem(context, (clcStub as unknown) as CommonLanguageClient);
+    const command = registerCommandStub.firstCall.args[1];
+    await command();
+    quickPick.select([]);
+    await quickPick.accept();
+
+    expect(update).calledOnceWith(
+      'schemas',
+      {
+        [schemaUri]: ['*.yaml', '!file:///workspace/test.yaml'],
+      },
+      vscode.ConfigurationTarget.Workspace
+    );
+    expect(update).not.calledWith('disableSchemaDetection');
+  });
+
+  it('Should update only the scope containing a deselected schema', async () => {
+    const context: vscode.ExtensionContext = {
+      subscriptions: [],
+    } as vscode.ExtensionContext;
+    const statusBar = ({ show: sandbox.stub(), hide: sandbox.stub() } as unknown) as vscode.StatusBarItem;
+    const quickPick = createQuickPickStubValue<TestSchemaItem>();
+    const update = sandbox.stub();
+    const userSchemaUri = 'https://json.schemastore.org/github-workflow.json';
+    const workspaceSchemaUri = 'https://json.schemastore.org/docker-compose.json';
+    const globalSchemas = { [userSchemaUri]: '*.yaml' };
+    const workspaceSchemas = { [workspaceSchemaUri]: '*.yaml' };
+    createStatusBarItemStub.returns(statusBar);
+    createQuickPickStub.returns(quickPick);
+    clcStub.sendRequest.resolves([
+      { uri: userSchemaUri, name: 'github-workflow', usedForCurrentFile: true },
+      { uri: workspaceSchemaUri, name: 'docker-compose', usedForCurrentFile: true },
+    ]);
+    activeTextEditor = ({
+      document: { languageId: 'yaml', uri: vscode.Uri.parse('/workspace/test.yaml') },
+    } as unknown) as vscode.TextEditor;
+    sandbox
+      .stub(vscode.workspace, 'getConfiguration')
+      .withArgs('yaml')
+      .returns(({
+        get: sandbox
+          .stub()
+          .callsFake((section: string) => (section === 'schemas' ? { ...globalSchemas, ...workspaceSchemas } : [])),
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          globalValue: section === 'schemas' ? globalSchemas : undefined,
+          workspaceValue: section === 'schemas' ? workspaceSchemas : undefined,
+        })),
+        update,
+      } as unknown) as vscode.WorkspaceConfiguration);
+
+    createJSONSchemaStatusBarItem(context, (clcStub as unknown) as CommonLanguageClient);
+    const command = registerCommandStub.firstCall.args[1];
+    await command();
+    const userSchemaItem = quickPick.items.find((item) => (item.schema as { uri?: string })?.uri === userSchemaUri);
+    quickPick.select([userSchemaItem as TestSchemaItem]);
+    await quickPick.accept();
+
+    expect(update).calledOnceWith(
+      'schemas',
+      {
+        [workspaceSchemaUri]: ['*.yaml', '!file:///workspace/test.yaml'],
+      },
+      vscode.ConfigurationTarget.Workspace
+    );
+    expect(update).not.calledWith('schemas', sinon.match.any, vscode.ConfigurationTarget.Global);
+    expect(update).not.calledWith('disableSchemaDetection');
   });
 
   it('Should clear disableSchemaDetection when a schema is selected', async () => {
@@ -407,6 +547,9 @@ describe('Status bar should work in multiple different scenarios', () => {
       .withArgs('yaml')
       .returns(({
         get,
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'disableSchemaDetection' ? ['file:///foo.yaml', 'file:///other.yaml'] : {},
+        })),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -420,50 +563,6 @@ describe('Status bar should work in multiple different scenarios', () => {
 
     expect(update).calledWith('disableSchemaDetection', ['file:///other.yaml']);
     expect(update).calledWith('schemas', { 'https://foo.com/bar.json': 'file:///foo.yaml' });
-    expect(quickPick.hide).calledOnce;
-  });
-
-  it('Should replace existing exact schema mappings when a schema is selected', async () => {
-    const context: vscode.ExtensionContext = {
-      subscriptions: [],
-    } as vscode.ExtensionContext;
-    const statusBar = ({ show: sandbox.stub(), hide: sandbox.stub() } as unknown) as vscode.StatusBarItem;
-    const quickPick = createQuickPickStubValue<TestSchemaItem>();
-    const update = sandbox.stub();
-    const get = sandbox.stub();
-    get.withArgs('disableSchemaDetection').returns(['foo.yaml', 'file:///other.yaml']);
-    get.withArgs('schemas').returns({
-      'https://foo.com/old-a.json': 'foo.yaml',
-      'https://foo.com/old-b.json': ['foo.yaml', 'bar.yaml'],
-    });
-    createStatusBarItemStub.returns(statusBar);
-    createQuickPickStub.returns(quickPick);
-    clcStub.sendRequest.resolves([{ uri: 'https://foo.com/new.json', name: 'new schema' }]);
-    activeTextEditor = ({
-      document: { languageId: 'yaml', uri: vscode.Uri.parse('/workspace/foo.yaml') },
-    } as unknown) as vscode.TextEditor;
-    sandbox.stub(vscode.workspace, 'asRelativePath').returns('foo.yaml');
-    sandbox
-      .stub(vscode.workspace, 'getConfiguration')
-      .withArgs('yaml')
-      .returns(({
-        get,
-        update,
-      } as unknown) as vscode.WorkspaceConfiguration);
-
-    createJSONSchemaStatusBarItem(context, (clcStub as unknown) as CommonLanguageClient);
-    const command = registerCommandStub.firstCall.args[1];
-    await command();
-    const schemaItem = quickPick.items.find((item) => (item.schema as { uri?: string })?.uri === 'https://foo.com/new.json');
-    expect(schemaItem).to.exist;
-    quickPick.select([schemaItem as TestSchemaItem]);
-    await quickPick.accept();
-
-    expect(update).calledWith('disableSchemaDetection', ['file:///other.yaml']);
-    expect(update).calledWith('schemas', {
-      'https://foo.com/old-b.json': ['bar.yaml'],
-      'https://foo.com/new.json': 'file:///workspace/foo.yaml',
-    });
     expect(quickPick.hide).calledOnce;
   });
 
@@ -491,6 +590,9 @@ describe('Status bar should work in multiple different scenarios', () => {
       .withArgs('yaml')
       .returns(({
         get,
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? {} : undefined,
+        })),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -502,7 +604,7 @@ describe('Status bar should work in multiple different scenarios', () => {
     quickPick.select(schemaItems as TestSchemaItem[]);
     await quickPick.accept();
 
-    expect(update).calledWith('disableSchemaDetection', []);
+    expect(update).not.calledWith('disableSchemaDetection');
     expect(update).calledWith('schemas', {
       'https://foo.com/a.json': 'file:///foo.yaml',
       'https://foo.com/b.json': 'file:///foo.yaml',
@@ -527,7 +629,8 @@ describe('Status bar should work in multiple different scenarios', () => {
       .stub(vscode.workspace, 'getConfiguration')
       .withArgs('yaml')
       .returns(({
-        get: sandbox.stub().withArgs('disableSchemaDetection').returns([]),
+        get: sandbox.stub().callsFake((section: string) => (section === 'schemas' ? {} : [])),
+        inspect: sandbox.stub().returns({}),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -539,8 +642,7 @@ describe('Status bar should work in multiple different scenarios', () => {
     expect(quickPick.selectedItems).to.deep.equal([quickPick.items[0]]);
     await quickPick.accept();
 
-    expect(update).calledWith('disableSchemaDetection', ['file:///foo.yaml']);
-    expect(update).not.calledWith('schemas');
+    expect(update).not.called;
     expect(quickPick.hide).calledOnce;
   });
 
@@ -561,7 +663,8 @@ describe('Status bar should work in multiple different scenarios', () => {
       .stub(vscode.workspace, 'getConfiguration')
       .withArgs('yaml')
       .returns(({
-        get: sandbox.stub().withArgs('disableSchemaDetection').returns([]),
+        get: sandbox.stub().callsFake((section: string) => (section === 'schemas' ? {} : [])),
+        inspect: sandbox.stub().returns({}),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -576,8 +679,7 @@ describe('Status bar should work in multiple different scenarios', () => {
     expect(quickPick.selectedItems).to.deep.equal([noSchemaItem]);
     await quickPick.accept();
 
-    expect(update).calledWith('disableSchemaDetection', ['file:///foo.yaml']);
-    expect(update).not.calledWith('schemas');
+    expect(update).not.called;
     expect(quickPick.hide).calledOnce;
   });
 
@@ -602,6 +704,9 @@ describe('Status bar should work in multiple different scenarios', () => {
       .withArgs('yaml')
       .returns(({
         get,
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? {} : undefined,
+        })),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -615,7 +720,7 @@ describe('Status bar should work in multiple different scenarios', () => {
     expect(quickPick.selectedItems).to.deep.equal([schemaItem]);
     await quickPick.accept();
 
-    expect(update).calledWith('disableSchemaDetection', []);
+    expect(update).not.calledWith('disableSchemaDetection');
     expect(update).calledWith('schemas', { 'https://foo.com/bar.json': 'file:///foo.yaml' });
     expect(quickPick.hide).calledOnce;
   });
@@ -654,6 +759,9 @@ describe('Status bar should work in multiple different scenarios', () => {
       .withArgs('yaml')
       .returns(({
         get,
+        inspect: sandbox.stub().callsFake((section: string) => ({
+          workspaceValue: section === 'schemas' ? {} : undefined,
+        })),
         update,
       } as unknown) as vscode.WorkspaceConfiguration);
 
@@ -672,7 +780,7 @@ describe('Status bar should work in multiple different scenarios', () => {
     await versionPick.select([versionItem as TestSchemaVersionItem]);
 
     expect(schemaPick.hide).calledOnce;
-    expect(update).calledWith('disableSchemaDetection', []);
+    expect(update).not.calledWith('disableSchemaDetection');
     expect(update).calledWith('schemas', {
       'https://foo.com/b.json': 'file:///foo.yaml',
       'https://foo.com/a-v2.json': 'file:///foo.yaml',

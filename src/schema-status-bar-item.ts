@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import {
+  ConfigurationTarget,
   ExtensionContext,
   window,
   commands,
@@ -201,16 +202,10 @@ async function showSchemaSelection(): Promise<void> {
 
   schemasPick.onDidAccept(async () => {
     try {
-      if (schemasPick.selectedItems.length === 0 || schemasPick.selectedItems.some((item) => item.disableSchemaDetection)) {
-        await writeDisableSchemaDetectionMapping(fileUri);
-      } else {
-        const schemaUrls = schemasPick.selectedItems.flatMap((item) => (item.schema ? [item.schema.uri] : []));
-        if (schemaUrls.length === 0) {
-          await writeDisableSchemaDetectionMapping(fileUri);
-        } else {
-          await writeSchemaUriMappings(schemaUrls, fileUri);
-        }
-      }
+      const schemaUrls = schemasPick.selectedItems.flatMap((item) => (item.schema ? [item.schema.uri] : []));
+      const previouslyUsedUris = schemas.filter((s) => s.usedForCurrentFile).map((s) => s.uri);
+      const deselectedUris = previouslyUsedUris.filter((uri) => !schemaUrls.includes(uri));
+      await writeSchemaUriMappings(schemaUrls, fileUri, deselectedUris);
     } catch (err) {
       console.error(err);
     }
@@ -242,31 +237,6 @@ function isSchemaDetectionDisabled(fileUri: string): boolean {
   return typeof disableSchemaDetection === 'string' && filePatterns.includes(disableSchemaDetection);
 }
 
-function deleteExistingFilePattern(settings: Record<string, unknown>, filePatterns: string[]): unknown {
-  for (const key in settings) {
-    if (Object.prototype.hasOwnProperty.call(settings, key)) {
-      const element = settings[key];
-
-      if (Array.isArray(element)) {
-        const remainingFilePatterns = element.filter(
-          (val): val is string => typeof val === 'string' && !filePatterns.includes(val)
-        );
-        if (remainingFilePatterns.length === 0) {
-          delete settings[key];
-        } else {
-          settings[key] = remainingFilePatterns;
-        }
-      }
-
-      if (typeof element === 'string' && filePatterns.includes(element)) {
-        delete settings[key];
-      }
-    }
-  }
-
-  return settings;
-}
-
 function removeFilePatternFromSetting(setting: unknown, filePatterns: string[]): string | string[] {
   if (Array.isArray(setting)) {
     return setting.filter((value): value is string => typeof value === 'string' && !filePatterns.includes(value));
@@ -277,22 +247,6 @@ function removeFilePatternFromSetting(setting: unknown, filePatterns: string[]):
   }
 
   return typeof setting === 'string' ? setting : [];
-}
-
-function addFilePatternToSetting(setting: unknown, fileUri: string): string | string[] {
-  if (Array.isArray(setting)) {
-    const filePatterns = setting.filter((value): value is string => typeof value === 'string');
-    if (!filePatterns.includes(fileUri)) {
-      filePatterns.push(fileUri);
-    }
-    return filePatterns;
-  }
-
-  if (typeof setting === 'string') {
-    return setting === fileUri ? setting : [setting, fileUri];
-  }
-
-  return [fileUri];
 }
 
 function findSchemaStoreItem(schemas: JSONSchema[], url: string): [string, JSONSchema] | undefined {
@@ -307,38 +261,105 @@ function findSchemaStoreItem(schemas: JSONSchema[], url: string): [string, JSONS
   }
 }
 
-async function writeSchemaUriMappings(schemaUrls: string[], fileUri: string): Promise<void> {
+async function writeSchemaUriMappings(schemaUrls: string[], fileUri: string, deselectedSchemaUris: string[] = []): Promise<void> {
   const yamlConfiguration = workspace.getConfiguration('yaml');
-  const settings: Record<string, unknown> = yamlConfiguration.get('schemas');
-  const disableSchemaDetection = yamlConfiguration.get('disableSchemaDetection');
   const filePatterns = getFilePatternCandidates(fileUri);
-  await yamlConfiguration.update('disableSchemaDetection', removeFilePatternFromSetting(disableSchemaDetection, filePatterns));
-  const newSettings = Object.assign({}, settings);
-  deleteExistingFilePattern(newSettings, filePatterns);
 
-  for (const schemaUrl of schemaUrls) {
-    const schemaSettings = newSettings[schemaUrl];
-    if (schemaSettings) {
-      if (Array.isArray(schemaSettings)) {
-        const schemaFilePatterns = schemaSettings.filter((value): value is string => typeof value === 'string');
-        if (!schemaFilePatterns.includes(fileUri)) {
-          schemaFilePatterns.push(fileUri);
-        }
-        newSettings[schemaUrl] = schemaFilePatterns;
-      } else if (typeof schemaSettings === 'string') {
-        newSettings[schemaUrl] = schemaSettings === fileUri ? schemaSettings : [schemaSettings, fileUri];
-      }
-    } else {
-      newSettings[schemaUrl] = fileUri;
+  if (schemaUrls.length > 0) {
+    // Clean up disableSchemaDetection from each scope individually
+    const disableInspect = yamlConfiguration.inspect<string | string[]>('disableSchemaDetection');
+    if (disableInspect?.globalValue !== undefined) {
+      await yamlConfiguration.update(
+        'disableSchemaDetection',
+        removeFilePatternFromSetting(disableInspect.globalValue, filePatterns),
+        ConfigurationTarget.Global
+      );
+    }
+    if (disableInspect?.workspaceValue !== undefined) {
+      await yamlConfiguration.update(
+        'disableSchemaDetection',
+        removeFilePatternFromSetting(disableInspect.workspaceValue, filePatterns),
+        ConfigurationTarget.Workspace
+      );
+    }
+    if (disableInspect?.workspaceFolderValue !== undefined) {
+      await yamlConfiguration.update(
+        'disableSchemaDetection',
+        removeFilePatternFromSetting(disableInspect.workspaceFolderValue, filePatterns),
+        ConfigurationTarget.WorkspaceFolder
+      );
     }
   }
-  await yamlConfiguration.update('schemas', newSettings);
-}
 
-async function writeDisableSchemaDetectionMapping(fileUri: string): Promise<void> {
-  const yamlConfiguration = workspace.getConfiguration('yaml');
-  const disableSchemaDetection = yamlConfiguration.get('disableSchemaDetection');
-  await yamlConfiguration.update('disableSchemaDetection', addFilePatternToSetting(disableSchemaDetection, fileUri));
+  const allSettingsSchemas: Record<string, string | string[]> = yamlConfiguration.get('schemas') ?? {};
+  function resolveSettingsKey(schemaUri: string): string {
+    if (Object.hasOwn(allSettingsSchemas, schemaUri)) return schemaUri;
+    for (const candidate of getFilePatternCandidates(schemaUri)) {
+      if (Object.hasOwn(allSettingsSchemas, candidate)) return candidate;
+    }
+    return schemaUri;
+  }
+
+  const schemasInspect = yamlConfiguration.inspect<Record<string, unknown>>('schemas');
+  const negationPatterns = new Set(filePatterns.map((p) => '!' + p));
+  const deselectedSchemas = new Set(deselectedSchemaUris.map(resolveSettingsKey));
+  const selectedSchemas = new Set(schemaUrls.map(resolveSettingsKey));
+  const selectedHandled = new Set<string>();
+  const scopes: { value: Record<string, unknown> | undefined; target: ConfigurationTarget }[] = [
+    { value: schemasInspect?.globalValue, target: ConfigurationTarget.Global },
+    { value: schemasInspect?.workspaceValue, target: ConfigurationTarget.Workspace },
+    { value: schemasInspect?.workspaceFolderValue, target: ConfigurationTarget.WorkspaceFolder },
+  ];
+
+  for (const scope of scopes) {
+    if (!scope.value) continue;
+    const settings = Object.assign({}, scope.value);
+    let modified = false;
+
+    for (const schemaUri of Object.keys(settings)) {
+      const value = settings[schemaUri];
+      const normalizedValue: string[] = Array.isArray(value) ? value : [value];
+
+      if (deselectedSchemas.has(schemaUri)) {
+        // Add negation
+        const filtered = normalizedValue.filter((v) => !filePatterns.includes(v));
+        if (filtered.some((p) => !p.startsWith('!'))) {
+          filtered.push('!' + Uri.parse(fileUri));
+          settings[schemaUri] = filtered;
+        } else {
+          delete settings[schemaUri];
+        }
+        modified = true;
+      } else if (selectedSchemas.has(schemaUri)) {
+        // Remove any negation for this file
+        const filtered = normalizedValue.filter((v) => !negationPatterns.has(v));
+        if (filtered.length !== normalizedValue.length) {
+          settings[schemaUri] = filtered.length === 1 ? filtered[0] : filtered;
+          modified = true;
+        }
+        selectedHandled.add(schemaUri);
+      }
+    }
+
+    if (modified) {
+      await yamlConfiguration.update('schemas', settings, scope.target);
+    }
+  }
+
+  // For selected schemas not found in any scope, add to fallback scope.
+  const unhandled = schemaUrls.filter((url) => !selectedHandled.has(resolveSettingsKey(url)));
+  if (unhandled.length > 0) {
+    const hasWorkspace = (workspace.workspaceFolders?.length ?? 0) > 0;
+    const fallbackTarget = hasWorkspace ? ConfigurationTarget.Workspace : ConfigurationTarget.Global;
+    const settings: Record<string, unknown> = Object.assign(
+      {},
+      (hasWorkspace ? schemasInspect?.workspaceValue : schemasInspect?.globalValue) ?? {}
+    );
+    for (const schemaUrl of unhandled) {
+      settings[resolveSettingsKey(schemaUrl)] = fileUri;
+    }
+    await yamlConfiguration.update('schemas', settings, fallbackTarget);
+  }
 }
 
 function handleSchemaVersionSelection(schema: MatchingJSONSchema, fileUri: string, selectedSchemaUris: string[]): void {
