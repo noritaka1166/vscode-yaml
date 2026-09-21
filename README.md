@@ -122,6 +122,18 @@ The `yaml.schemas` setting maps schemas to file patterns using key-value pairs:
 - **Key**: Schema URI, local file path, or the `kubernetes` keyword
 - **Value**: A glob pattern or array of glob patterns
 
+Prefix a pattern with `!` to exclude matching files from that schema association. An association with exclusions must also contain at least one positive pattern. For example, this applies the schema to YAML files except files whose names end with `test.yaml`:
+
+```json
+{
+  "yaml.schemas": {
+    "https://example.com/schema.json": ["*.yaml", "!*test.yaml"]
+  }
+}
+```
+
+An exclusion affects only the schema in the same entry. To disable all detected schemas for matching files, use [`yaml.disableSchemaDetection`](#using-yamldisableschemadetection).
+
 #### Remote schemas
 
 Use a schema URL as the key:
